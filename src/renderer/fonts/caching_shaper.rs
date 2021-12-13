@@ -86,6 +86,10 @@ impl CachingShaper {
         self.blob_cache.clear();
     }
 
+    pub fn font_names(&self) -> Vec<String> {
+        self.font_loader.font_names()
+    }
+
     fn metrics(&mut self) -> Metrics {
         let font_pair = self.current_font_pair();
         let size = self.current_size();

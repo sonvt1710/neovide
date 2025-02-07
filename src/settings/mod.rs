@@ -1,3 +1,4 @@
+mod font;
 mod from_value;
 mod window_size;
 
@@ -12,20 +13,18 @@ use std::{
     convert::TryInto,
     fmt::Debug,
 };
+use winit::event_loop::EventLoopProxy;
 
-use crate::bridge::NeovimWriter;
+use crate::{bridge::NeovimWriter, window::UserEvent};
 pub use from_value::ParseFromValue;
 pub use window_size::{
-    load_last_window_settings, save_window_size, PersistentWindowSettings, DEFAULT_GRID_SIZE,
-    MAX_GRID_SIZE, MIN_GRID_SIZE,
+    clamped_grid_size, load_last_window_settings, neovide_std_datapath, save_window_size,
+    PersistentWindowSettings, DEFAULT_GRID_SIZE, MIN_GRID_SIZE,
 };
 
 mod config;
-pub use config::Config;
-
-lazy_static! {
-    pub static ref SETTINGS: Settings = Settings::new();
-}
+pub use config::{Config, HotReloadConfigs};
+pub use font::FontSettings;
 
 pub trait SettingGroup {
     type ChangedEvent: Debug + Clone + Send + Sync + Any;
@@ -33,7 +32,7 @@ pub trait SettingGroup {
 }
 
 // Function types to handle settings updates
-type UpdateHandlerFunc = fn(&Settings, Value, bool);
+type UpdateHandlerFunc = fn(&Settings, Value) -> SettingsChanged;
 type ReaderHandlerFunc = fn(&Settings) -> Option<Value>;
 
 // The Settings struct acts as a global container where each of Neovide's subsystems can store
@@ -43,6 +42,7 @@ type ReaderHandlerFunc = fn(&Settings) -> Option<Value>;
 // read_initial_values call, after that point we should not modify the contents of the Settings
 // struct except when prompted by an update event from nvim. Otherwise, the settings in Neovide and
 // nvim will get out of sync.
+#[derive(Default, Debug)]
 pub struct Settings {
     settings: RwLock<HashMap<TypeId, Box<dyn Any + Send + Sync>>>,
     updaters: RwLock<HashMap<SettingLocation, UpdateHandlerFunc>>,
@@ -58,12 +58,8 @@ pub enum SettingLocation {
 }
 
 impl Settings {
-    fn new() -> Self {
-        Self {
-            settings: RwLock::new(HashMap::new()),
-            updaters: RwLock::new(HashMap::new()),
-            readers: RwLock::new(HashMap::new()),
-        }
+    pub fn new() -> Self {
+        Self::default()
     }
 
     pub fn set_setting_handlers(
@@ -112,7 +108,7 @@ impl Settings {
                     let variable_name = format!("neovide_{name}");
                     match nvim.get_var(&variable_name).await {
                         Ok(value) => {
-                            self.updaters.read().get(&location).unwrap()(self, value, false);
+                            self.updaters.read().get(&location).unwrap()(self, value);
                         }
                         Err(error) => {
                             trace!("Initial value load failed for {}: {}", name, error);
@@ -127,7 +123,7 @@ impl Settings {
                 }
                 SettingLocation::NeovimOption(name) => match nvim.get_option(name).await {
                     Ok(value) => {
-                        self.updaters.read().get(&location).unwrap()(self, value, false);
+                        self.updaters.read().get(&location).unwrap()(self, value);
                     }
                     Err(error) => {
                         trace!("Initial value load failed for {}: {}", name, error);
@@ -138,30 +134,43 @@ impl Settings {
         Ok(())
     }
 
-    pub fn handle_setting_changed_notification(&self, arguments: Vec<Value>) {
+    pub fn handle_setting_changed_notification(
+        &self,
+        arguments: Vec<Value>,
+        event_loop_proxy: &EventLoopProxy<UserEvent>,
+    ) {
         let mut arguments = arguments.into_iter();
         let (name, value) = (arguments.next().unwrap(), arguments.next().unwrap());
 
         let name: Result<String, _> = name.try_into();
         let name = name.unwrap();
 
-        self.updaters
+        let event = self
+            .updaters
             .read()
             .get(&SettingLocation::NeovideGlobal(name))
-            .unwrap()(self, value, true);
+            .unwrap()(self, value);
+        let _ = event_loop_proxy.send_event(event.into());
     }
 
-    pub fn handle_option_changed_notification(&self, arguments: Vec<Value>) {
+    pub fn handle_option_changed_notification(
+        &self,
+        arguments: Vec<Value>,
+        event_loop_proxy: &EventLoopProxy<UserEvent>,
+    ) {
         let mut arguments = arguments.into_iter();
         let (name, value) = (arguments.next().unwrap(), arguments.next().unwrap());
 
         let name: Result<String, _> = name.try_into();
         let name = name.unwrap();
 
-        self.updaters
+        let event = self
+            .updaters
             .read()
             .get(&SettingLocation::NeovimOption(name))
-            .unwrap()(self, value, true);
+            .unwrap()(self, value);
+
+        let _ = event_loop_proxy.send_event(event.into());
     }
 
     pub fn register<T: SettingGroup>(&self) {
@@ -169,8 +178,37 @@ impl Settings {
     }
 }
 
+#[derive(Clone, Debug, PartialEq)]
+pub enum SettingsChanged {
+    Window(crate::window::WindowSettingsChanged),
+    Cursor(crate::renderer::cursor_renderer::CursorSettingsChanged),
+    Renderer(crate::renderer::RendererSettingsChanged),
+    #[cfg(test)]
+    Test(tests::TestSettingsChanged),
+}
+
 #[cfg(test)]
 mod tests {
+    #[derive(Clone, SettingGroup)]
+    struct TestSettings {
+        foo: String,
+        bar: String,
+        baz: String,
+        #[option = "mousemoveevent"]
+        mousemoveevent_option: Option<bool>,
+    }
+
+    impl Default for TestSettings {
+        fn default() -> Self {
+            Self {
+                foo: "foo".to_string(),
+                bar: "bar".to_string(),
+                baz: "baz".to_string(),
+                mousemoveevent_option: None,
+            }
+        }
+    }
+
     use async_trait::async_trait;
     use nvim_rs::{Handler, Neovim};
 
@@ -206,7 +244,9 @@ mod tests {
 
         let location = SettingLocation::NeovideGlobal("foo".to_owned());
 
-        fn noop_update(_settings: &Settings, _value: Value, _send_changed_event: bool) {}
+        fn noop_update(_settings: &Settings, _value: Value) -> SettingsChanged {
+            SettingsChanged::Test(TestSettingsChanged::Foo("hello".to_string()))
+        }
         fn noop_read(_settings: &Settings) -> Option<Value> {
             None
         }
@@ -274,35 +314,14 @@ mod tests {
 
     #[tokio::test]
     async fn test_read_initial_values() {
-        #[derive(Clone, SettingGroup)]
-        struct TestSettings {
-            foo: String,
-            bar: String,
-            baz: String,
-            #[option = "mousemoveevent"]
-            mousemoveevent_option: Option<bool>,
-        }
-
-        impl Default for TestSettings {
-            fn default() -> Self {
-                Self {
-                    foo: "foo".to_string(),
-                    bar: "bar".to_string(),
-                    baz: "baz".to_string(),
-                    mousemoveevent_option: None,
-                }
-            }
-        }
-
         let settings = Settings::new();
         settings.register::<TestSettings>();
 
         //create_nvim_command tries to read from CmdLineSettings.neovim_args
-        //TODO: this sets a static variable. Can this have side effects on other tests?
-        SETTINGS.set::<CmdLineSettings>(&CmdLineSettings::default());
+        settings.set::<CmdLineSettings>(&CmdLineSettings::default());
 
-        let command =
-            create_nvim_command().unwrap_or_explained_panic("Could not create nvim command");
+        let command = create_nvim_command(&settings)
+            .unwrap_or_explained_panic("Could not create nvim command");
         let instance = NeovimInstance::Embedded(command);
         let NeovimSession { neovim: nvim, .. } = NeovimSession::new(instance, NeovimHandler())
             .await

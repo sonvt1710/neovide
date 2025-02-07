@@ -35,6 +35,7 @@ fn stream(input: DeriveInput, prefix: String) -> TokenStream {
 
 fn struct_stream(name: Ident, prefix: String, data: &DataStruct) -> TokenStream {
     let event_name = format_ident!("{}Changed", name);
+    let name_without_settings = Ident::new(&name.to_string().replace("Settings", ""), name.span());
 
     let listener_fragments = data.fields.iter().map(|field| match field.ident {
         Some(ref ident) => {
@@ -73,15 +74,11 @@ fn struct_stream(name: Ident, prefix: String, data: &DataStruct) -> TokenStream 
             };
 
             quote! {{
-                fn update(settings: &crate::settings::Settings, value: rmpv::Value, send_changed_event: bool) {
+                fn update(settings: &crate::settings::Settings, value: rmpv::Value) -> crate::settings::SettingsChanged {
                     let mut s = settings.get::<#name>();
                     s.#ident.parse_from_value(value);
                     settings.set(&s);
-                    if send_changed_event {
-                        crate::event_aggregator::EVENT_AGGREGATOR.send(
-                            #event_name::#case_ident(s.#ident.clone()),
-                        );
-                    }
+                    #event_name::#case_ident(s.#ident.clone()).into()
                 }
 
                 #reader
@@ -108,7 +105,7 @@ fn struct_stream(name: Ident, prefix: String, data: &DataStruct) -> TokenStream 
         }
     });
     let expanded = quote! {
-        #[derive(Debug, Clone)]
+        #[derive(Debug, Clone, PartialEq, strum::AsRefStr)]
         pub enum #event_name {
             #(#updated_case_fragments)*
         }
@@ -121,16 +118,24 @@ fn struct_stream(name: Ident, prefix: String, data: &DataStruct) -> TokenStream 
                 #(#listener_fragments)*
             }
         }
+
+        impl From<#event_name> for crate::settings::SettingsChanged {
+            fn from(value: #event_name) -> Self {
+                crate::settings::SettingsChanged::#name_without_settings(value)
+            }
+        }
     };
     TokenStream::from(expanded)
 }
 
 fn setting_prefix(attrs: &[Attribute]) -> Option<String> {
     for attr in attrs.iter() {
-        if let Ok(Meta::NameValue(name_value)) = attr.parse_meta() {
-            if name_value.path.is_ident("setting_prefix") {
-                if let Lit::Str(literal) = name_value.lit {
-                    return Some(literal.value());
+        if let Meta::NameValue(name_value) = &attr.meta {
+            if attr.path().is_ident("setting_prefix") {
+                if let syn::Expr::Lit(expr) = &name_value.value {
+                    if let Lit::Str(literal) = &expr.lit {
+                        return Some(literal.value());
+                    }
                 }
             }
         }
@@ -140,13 +145,15 @@ fn setting_prefix(attrs: &[Attribute]) -> Option<String> {
 
 fn option(field: &Field) -> Result<Option<String>, Error> {
     for attr in field.attrs.iter() {
-        if !attr.path.is_ident("option") {
+        if !attr.path().is_ident("option") {
             continue;
         }
 
-        if let Ok(Meta::NameValue(name_value)) = attr.parse_meta() {
-            if let Lit::Str(literal) = name_value.lit {
-                return Ok(Some(literal.value()));
+        if let Meta::NameValue(name_value) = &attr.meta {
+            if let syn::Expr::Lit(expr) = &name_value.value {
+                if let Lit::Str(literal) = &expr.lit {
+                    return Ok(Some(literal.value()));
+                }
             }
         }
         return Err(Error::new_spanned(

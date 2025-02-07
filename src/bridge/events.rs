@@ -4,9 +4,10 @@ use std::{
     fmt::{self, Debug},
 };
 
-use log::debug;
+use log::{debug, warn};
 use rmpv::Value;
 use skia_safe::Color4f;
+use strum::AsRefStr;
 
 use crate::editor::{Colors, CursorMode, CursorShape, Style, UnderlineStyle};
 
@@ -96,6 +97,7 @@ impl MessageKind {
     }
 }
 
+#[allow(unused)]
 #[derive(Clone, Debug)]
 pub enum GuiOption {
     ArabicShape(bool),
@@ -104,14 +106,14 @@ pub enum GuiOption {
     GuiFont(String),
     GuiFontSet(String),
     GuiFontWide(String),
-    LineSpace(i64),
+    LineSpace(f64),
     Pumblend(u64),
     ShowTabLine(u64),
     TermGuiColors(bool),
     Unknown(String, Value),
 }
 
-#[derive(Clone, Debug)]
+#[derive(Clone, Debug, PartialEq)]
 pub enum WindowAnchor {
     NorthWest,
     NorthEast,
@@ -119,7 +121,7 @@ pub enum WindowAnchor {
     SouthEast,
 }
 
-#[derive(Clone, Debug)]
+#[derive(Clone, Debug, PartialEq)]
 pub enum EditorMode {
     // The set of modes reported will change in new versions of Nvim, for
     // instance more sub-modes and temporary states might be represented as
@@ -134,7 +136,7 @@ pub enum EditorMode {
     Unknown(String),
 }
 
-#[derive(Clone, Debug)]
+#[derive(Clone, Debug, AsRefStr)]
 pub enum RedrawEvent {
     SetTitle {
         title: String,
@@ -205,9 +207,11 @@ pub enum RedrawEvent {
         anchor_grid: u64,
         anchor_row: f64,
         anchor_column: f64,
+        #[allow(unused)]
         focusable: bool,
-        sort_order: Option<u64>,
+        z_index: u64,
     },
+    #[allow(unused)]
     WindowExternalPosition {
         grid: u64,
     },
@@ -221,17 +225,31 @@ pub enum RedrawEvent {
         grid: u64,
         row: u64,
         scrolled: bool,
+        #[allow(unused)]
         separator_character: String,
     },
     WindowViewport {
         grid: u64,
+        #[allow(unused)]
         top_line: f64,
+        #[allow(unused)]
         bottom_line: f64,
+        #[allow(unused)]
         current_line: f64,
+        #[allow(unused)]
         current_column: f64,
+        #[allow(unused)]
         line_count: Option<f64>,
         scroll_delta: Option<f64>,
     },
+    WindowViewportMargins {
+        grid: u64,
+        top: u64,
+        bottom: u64,
+        left: u64,
+        right: u64,
+    },
+    #[allow(unused)]
     CommandLineShow {
         content: StyledContent,
         position: u64,
@@ -240,43 +258,51 @@ pub enum RedrawEvent {
         indent: u64,
         level: u64,
     },
+    #[allow(unused)]
     CommandLinePosition {
         position: u64,
         level: u64,
     },
+    #[allow(unused)]
     CommandLineSpecialCharacter {
         character: String,
         shift: bool,
         level: u64,
     },
+    #[allow(unused)]
     CommandLineHide,
+    #[allow(unused)]
     CommandLineBlockShow {
         lines: Vec<StyledContent>,
     },
+    #[allow(unused)]
     CommandLineBlockAppend {
         line: StyledContent,
     },
+    #[allow(unused)]
     CommandLineBlockHide,
+    #[allow(unused)]
     MessageShow {
         kind: MessageKind,
         content: StyledContent,
         replace_last: bool,
     },
     MessageClear,
+    #[allow(unused)]
     MessageShowMode {
         content: StyledContent,
     },
+    #[allow(unused)]
     MessageShowCommand {
         content: StyledContent,
     },
+    #[allow(unused)]
     MessageRuler {
         content: StyledContent,
     },
+    #[allow(unused)]
     MessageHistoryShow {
         entries: Vec<(MessageKind, StyledContent)>,
-    },
-    ShowIntro {
-        message: Vec<String>,
     },
     Suspend,
 }
@@ -426,7 +452,7 @@ fn parse_option_set(option_set_arguments: Vec<Value>) -> Result<RedrawEvent> {
             "guifont" => GuiOption::GuiFont(parse_string(value)?),
             "guifontset" => GuiOption::GuiFontSet(parse_string(value)?),
             "guifontwide" => GuiOption::GuiFontWide(parse_string(value)?),
-            "linespace" => GuiOption::LineSpace(parse_i64(value)?),
+            "linespace" => GuiOption::LineSpace(parse_f64(value)?),
             "pumblend" => GuiOption::Pumblend(parse_u64(value)?),
             "showtabline" => GuiOption::ShowTabLine(parse_u64(value)?),
             "termguicolors" => GuiOption::TermGuiColors(parse_bool(value)?),
@@ -475,7 +501,7 @@ fn parse_default_colors(default_colors_arguments: Vec<Value>) -> Result<RedrawEv
     })
 }
 
-fn parse_style(style_map: Value) -> Result<Style> {
+fn parse_style(style_map: Value, _info_array: Value) -> Result<Style> {
     let attributes = parse_map(style_map)?;
 
     let mut style = Style::new(Colors::new(None, None, None));
@@ -527,9 +553,9 @@ fn parse_style(style_map: Value) -> Result<Style> {
 }
 
 fn parse_hl_attr_define(hl_attr_define_arguments: Vec<Value>) -> Result<RedrawEvent> {
-    let [id, attributes, _terminal_attributes, _info] = extract_values(hl_attr_define_arguments)?;
+    let [id, attributes, _terminal_attributes, infos] = extract_values(hl_attr_define_arguments)?;
 
-    let style = parse_style(attributes)?;
+    let style = parse_style(attributes, infos)?;
     Ok(RedrawEvent::HighlightAttributesDefine {
         id: parse_u64(id)?,
         style,
@@ -598,12 +624,19 @@ fn parse_grid_destroy(grid_destroy_arguments: Vec<Value>) -> Result<RedrawEvent>
 
 fn parse_grid_cursor_goto(cursor_goto_arguments: Vec<Value>) -> Result<RedrawEvent> {
     let [grid_id, row, column] = extract_values(cursor_goto_arguments)?;
+    let validate = |v, field| {
+        (if v < 0 {
+            warn!("Negative cursor {field} received from Neovim {v}");
+            0
+        } else {
+            v
+        }) as u64
+    };
+    let grid = parse_u64(grid_id)?;
+    let row = validate(parse_i64(row)?, "row");
+    let column = validate(parse_i64(column)?, "column");
 
-    Ok(RedrawEvent::CursorGoto {
-        grid: parse_u64(grid_id)?,
-        row: parse_u64(row)?,
-        column: parse_u64(column)?,
-    })
+    Ok(RedrawEvent::CursorGoto { grid, row, column })
 }
 
 fn parse_grid_scroll(grid_scroll_arguments: Vec<Value>) -> Result<RedrawEvent> {
@@ -644,8 +677,8 @@ fn parse_window_anchor(value: Value) -> Result<WindowAnchor> {
 }
 
 fn parse_win_float_pos(win_float_pos_arguments: Vec<Value>) -> Result<RedrawEvent> {
-    let ([grid, _window, anchor, anchor_grid, anchor_row, anchor_column, focusable], [sort_order]) =
-        extract_values_with_optional(win_float_pos_arguments)?;
+    let [grid, _window, anchor, anchor_grid, anchor_row, anchor_column, focusable, z_index] =
+        extract_values(win_float_pos_arguments)?;
 
     Ok(RedrawEvent::WindowFloatPosition {
         grid: parse_u64(grid)?,
@@ -654,7 +687,7 @@ fn parse_win_float_pos(win_float_pos_arguments: Vec<Value>) -> Result<RedrawEven
         anchor_row: parse_f64(anchor_row)?,
         anchor_column: parse_f64(anchor_column)?,
         focusable: parse_bool(focusable)?,
-        sort_order: sort_order.map(parse_u64).transpose()?,
+        z_index: parse_u64(z_index)?,
     })
 }
 
@@ -707,6 +740,18 @@ fn parse_win_viewport(win_viewport_arguments: Vec<Value>) -> Result<RedrawEvent>
         current_column: parse_f64(current_column)?,
         line_count: line_count.map(parse_f64).transpose()?,
         scroll_delta: scroll_delta.map(parse_f64).transpose()?,
+    })
+}
+
+fn parse_win_viewport_margins(win_viewport_margins_arguments: Vec<Value>) -> Result<RedrawEvent> {
+    let [grid, _window, top, bottom, left, right] = extract_values(win_viewport_margins_arguments)?;
+
+    Ok(RedrawEvent::WindowViewportMargins {
+        grid: parse_u64(grid)?,
+        top: parse_u64(top)?,
+        bottom: parse_u64(bottom)?,
+        left: parse_u64(left)?,
+        right: parse_u64(right)?,
     })
 }
 
@@ -827,17 +872,6 @@ fn parse_msg_history_show(msg_history_show_arguments: Vec<Value>) -> Result<Redr
     })
 }
 
-fn parse_msg_intro(msg_intro_arguments: Vec<Value>) -> Result<RedrawEvent> {
-    let [lines] = extract_values(msg_intro_arguments)?;
-
-    Ok(RedrawEvent::ShowIntro {
-        message: parse_array(lines)?
-            .into_iter()
-            .map(parse_string)
-            .collect::<Result<_>>()?,
-    })
-}
-
 pub fn parse_redraw_event(event_value: Value) -> Result<Vec<RedrawEvent>> {
     let mut event_contents = parse_array(event_value)?.into_iter();
     let event_name = event_contents
@@ -877,6 +911,7 @@ pub fn parse_redraw_event(event_value: Value) -> Result<Vec<RedrawEvent>> {
             "win_close" => Some(parse_win_close(event_parameters)),
             "msg_set_pos" => Some(parse_msg_set_pos(event_parameters)),
             "win_viewport" => Some(parse_win_viewport(event_parameters)),
+            "win_viewport_margins" => Some(parse_win_viewport_margins(event_parameters)),
             "cmdline_show" => Some(parse_cmdline_show(event_parameters)),
             "cmdline_pos" => Some(parse_cmdline_pos(event_parameters)),
             "cmdline_special_char" => Some(parse_cmdline_special_char(event_parameters)),
@@ -890,7 +925,6 @@ pub fn parse_redraw_event(event_value: Value) -> Result<Vec<RedrawEvent>> {
             "msg_showcmd" => Some(parse_msg_showcmd(event_parameters)),
             "msg_ruler" => Some(parse_msg_ruler(event_parameters)),
             "msg_history_show" => Some(parse_msg_history_show(event_parameters)),
-            "msg_intro" => Some(parse_msg_intro(event_parameters)),
             "suspend" => Some(Ok(RedrawEvent::Suspend)),
             _ => None,
         };

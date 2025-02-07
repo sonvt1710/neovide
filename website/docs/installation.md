@@ -1,6 +1,6 @@
 # Installation
 
-**Note**: Neovide requires neovim version `0.6` _or greater_. See previous releases such as `0.5.0`
+**Note**: Neovide requires neovim version `0.10` _or greater_. See previous releases such as `0.5.0`
 if your distro is too slow with updating or you need to rely on older neovim versions.
 
 Building instructions are somewhat limited at the moment. All the libraries Neovide uses are cross
@@ -11,7 +11,7 @@ enough. On Windows this should be enabled by default if you have a relatively re
 ## Binaries
 
 Installing should be as simple as downloading the binary, making sure the `nvim` executable with
-version 0.6 or greater is on your `PATH` environment variable, and running it. Everything should be
+version 0.10 or greater is on your `PATH` environment variable, and running it. Everything should be
 self contained.
 
 The binaries are to be found on
@@ -62,6 +62,17 @@ line:
 brew install --cask neovide
 ```
 
+Neovide registers launched shells taking the user's preferred shell into account.
+
+If you are encountering issues with Neovide not being found by your shell, you can try to add the
+`brew` binary path to your `PATH` environment variable:
+
+```sh
+sudo launchctl config user path "$(brew --prefix)/bin:${PATH}"
+```
+
+For more information, see the Homebrew [FAQ](https://docs.brew.sh/FAQ#my-mac-apps-dont-find-homebrew-utilities).
+
 ### Mac Source
 
 1. Install the latest version of Rust. Using homebrew: `brew install rustup-init`
@@ -79,11 +90,9 @@ brew install --cask neovide
    The resulting binary is to be found under `~/.cargo/bin`. In case you want a nice application
    bundle:
 
-7. `cargo install cargo-bundle`
+7. `GENERATE_BUNDLE_APP=true GENERATE_DMG=true ./macos-builder/run`
 
-8. `cargo bundle --release`
-
-9. `cp -r ./target/release/bundle/osx/Neovide.app /Applications/Neovide.app` and enjoy.
+8. `open ./target/release/bundle/osx/Neovide.dmg`
 
 ## Linux
 
@@ -114,6 +123,9 @@ the source URL.
 Stable releases are packaged in nixpkgs in the `neovide` package, there's no flake. As such, if you
 just want to try it out in a transient shell, you can use this command.
 
+**Note**: On non-NixOS systems, chances are you'll need to use
+[nixGL](https://github.com/nix-community/nixGL) as wrapper for neovide.
+
 ```sh
 nix-shell -p neovide
 ```
@@ -126,16 +138,6 @@ Just add `neovide` from nixpkgs to your `environment.systemPackages` in `configu
 environment.systemPackages = with pkgs; [neovide];
 ```
 
-### Snap
-
-Neovide is also available in the Snap Store. You can install it using the command below.
-
-```sh
-snap install neovide
-```
-
-[![Get it from the Snap Store](https://snapcraft.io/static/images/badges/en/snap-store-white.svg)](https://snapcraft.io/neovide)
-
 ### Linux Source
 
 1. Install necessary dependencies (adjust for your preferred package manager, probably most of this
@@ -143,30 +145,30 @@ snap install neovide
 
    - Ubuntu/Debian
 
-      ```sh
-      sudo apt install -y curl \
-          gnupg ca-certificates git \
-          gcc-multilib g++-multilib cmake libssl-dev pkg-config \
-          libfreetype6-dev libasound2-dev libexpat1-dev libxcb-composite0-dev \
-          libbz2-dev libsndio-dev freeglut3-dev libxmu-dev libxi-dev libfontconfig1-dev \
-          libxcursor-dev
-      ```
+     ```sh
+     sudo apt install -y curl \
+         gnupg ca-certificates git \
+         gcc-multilib g++-multilib cmake libssl-dev pkg-config \
+         libfreetype6-dev libasound2-dev libexpat1-dev libxcb-composite0-dev \
+         libbz2-dev libsndio-dev freeglut3-dev libxmu-dev libxi-dev libfontconfig1-dev \
+         libxcursor-dev
+     ```
 
    - Fedora
 
-      ```sh
-      sudo dnf install fontconfig-devel freetype-devel libX11-xcb libX11-devel libstdc++-static libstdc++-devel
-      sudo dnf groupinstall "Development Tools" "Development Libraries"
-      ```
+     ```sh
+     sudo dnf install fontconfig-devel freetype-devel libX11-xcb libX11-devel libstdc++-static libstdc++-devel
+     sudo dnf groupinstall "Development Tools" "Development Libraries"
+     ```
 
    - Arch
 
-      Do note that an [AUR package](https://aur.archlinux.org/packages/neovide-git) already exists.
+     Do note that an [AUR package](https://aur.archlinux.org/packages/neovide-git) already exists.
 
-      ```sh
-      sudo pacman -S base-devel fontconfig freetype2 libglvnd sndio cmake \
-          git gtk3 python sdl2 vulkan-intel libxkbcommon-x11
-      ```
+     ```sh
+     sudo pacman -S base-devel fontconfig freetype2 libglvnd sndio cmake \
+         git gtk3 python sdl2 vulkan-intel libxkbcommon-x11
+     ```
 
 2. Install Rust
 

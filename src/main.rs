@@ -2,8 +2,14 @@
 // Test naming occasionally uses camelCase with underscores to separate sections of
 // the test name.
 #![cfg_attr(test, allow(non_snake_case))]
+#![allow(unknown_lints)]
 #[macro_use]
 extern crate neovide_derive;
+
+#[cfg(target_os = "windows")]
+#[cfg(test)]
+#[macro_use]
+extern crate approx;
 
 #[macro_use]
 extern crate clap;
@@ -15,12 +21,12 @@ mod cmd_line;
 mod dimensions;
 mod editor;
 mod error_handling;
-mod event_aggregator;
 mod frame;
 mod profiling;
 mod renderer;
 mod running_tracker;
 mod settings;
+mod units;
 mod utils;
 mod window;
 
@@ -29,18 +35,25 @@ mod windows_utils;
 
 #[macro_use]
 extern crate derive_new;
-#[macro_use]
-extern crate lazy_static;
+
+use std::{
+    env::{self, args},
+    fs::{create_dir_all, File, OpenOptions},
+    io::Write,
+    panic::set_hook,
+    process::ExitCode,
+    sync::Arc,
+    time::{Duration, SystemTime},
+};
 
 use anyhow::Result;
 use log::trace;
-use std::env::{self, args};
-use std::fs::{File, OpenOptions};
-use std::io::Write;
-use std::panic::{set_hook, PanicInfo};
-use std::time::SystemTime;
+use std::env::var;
+use std::panic::PanicHookInfo;
+use std::path::PathBuf;
 use time::macros::format_description;
 use time::OffsetDateTime;
+use winit::{error::EventLoopError, event_loop::EventLoopProxy};
 
 #[cfg(not(test))]
 use flexi_logger::{Cleanup, Criterion, Duplicate, FileSpec, Logger, Naming};
@@ -48,36 +61,35 @@ use flexi_logger::{Cleanup, Criterion, Duplicate, FileSpec, Logger, Naming};
 use backtrace::Backtrace;
 use bridge::NeovimRuntime;
 use cmd_line::CmdLineSettings;
-use editor::start_editor;
-use error_handling::{handle_startup_errors, NeovideExitCode};
+use error_handling::handle_startup_errors;
 use renderer::{cursor_renderer::CursorSettings, RendererSettings};
-#[cfg_attr(target_os = "windows", allow(unused_imports))]
-use settings::SETTINGS;
+use running_tracker::RunningTracker;
 use window::{
-    create_event_loop, create_window, determine_window_size, main_loop, WindowSettings, WindowSize,
+    create_event_loop, determine_window_size, UpdateLoop, UserEvent, WindowSettings, WindowSize,
 };
 
 pub use channel_utils::*;
-pub use event_aggregator::*;
-pub use running_tracker::*;
 #[cfg(target_os = "windows")]
 pub use windows_utils::*;
 
-use crate::settings::{load_last_window_settings, Config, PersistentWindowSettings};
+use crate::settings::{
+    load_last_window_settings, Config, FontSettings, PersistentWindowSettings, Settings,
+};
 
 pub use profiling::startup_profiler;
 
-const BACKTRACES_FILE: &str = "neovide_backtraces.log";
+const DEFAULT_BACKTRACES_FILE: &str = "neovide_backtraces.log";
+const BACKTRACES_FILE_ENV_VAR: &str = "NEOVIDE_BACKTRACES";
 const REQUEST_MESSAGE: &str = "This is a bug and we would love for it to be reported to https://github.com/neovide/neovide/issues";
 
-fn main() -> NeovideExitCode {
+fn main() -> ExitCode {
     set_hook(Box::new(|panic_info| {
         let backtrace = Backtrace::new();
 
         let stderr_msg = generate_stderr_log_message(panic_info, &backtrace);
         eprintln!("{stderr_msg}");
 
-        log_panic_to_file(panic_info, &backtrace);
+        log_panic_to_file(panic_info, &backtrace, &None);
     }));
 
     #[cfg(target_os = "windows")]
@@ -85,20 +97,53 @@ fn main() -> NeovideExitCode {
         windows_fix_dpi();
     }
 
-    let event_loop = create_event_loop();
+    // This variable is set by the AppImage runtime and causes problems for child processes
+    #[cfg(target_os = "linux")]
+    env::remove_var("ARGV0");
 
-    match setup() {
-        Err(err) => handle_startup_errors(err, event_loop).into(),
-        Ok((window_size, _runtime)) => {
-            start_editor();
-            clipboard::init(&event_loop);
-            let window = create_window(&event_loop, &window_size);
-            main_loop(window, window_size, event_loop).into()
+    let event_loop = create_event_loop();
+    clipboard::init(&event_loop);
+
+    let running_tracker = RunningTracker::new();
+    let settings = Arc::new(Settings::new());
+
+    match setup(
+        event_loop.create_proxy(),
+        running_tracker.clone(),
+        settings.clone(),
+    ) {
+        Err(err) => handle_startup_errors(err, event_loop, settings.clone()),
+        Ok((window_size, font_settings, runtime)) => {
+            let mut update_loop = UpdateLoop::new(
+                window_size,
+                font_settings,
+                event_loop.create_proxy(),
+                settings.clone(),
+            );
+
+            let result = event_loop.run_app(&mut update_loop);
+
+            // Wait a little bit more and force Nevoim to exit after that.
+            // This should not be required, but Neovim through libuv spawns childprocesses that inherits all the handles
+            // This means that the stdio and stderr handles are not properly closed, so the nvim-rs
+            // read will hang forever, waiting for more data to read.
+            // See https://github.com/neovide/neovide/issues/2182 (which includes links to libuv issues)
+            runtime.runtime.shutdown_timeout(Duration::from_millis(500));
+
+            match result {
+                Ok(_) => running_tracker.exit_code(),
+                Err(EventLoopError::ExitFailure(code)) => ExitCode::from(code as u8),
+                _ => ExitCode::FAILURE,
+            }
         }
     }
 }
 
-fn setup() -> Result<(WindowSize, NeovimRuntime)> {
+fn setup(
+    proxy: EventLoopProxy<UserEvent>,
+    running_tracker: RunningTracker,
+    settings: Arc<Settings>,
+) -> Result<(WindowSize, Option<FontSettings>, NeovimRuntime)> {
     //  --------------
     // | Architecture |
     //  --------------
@@ -118,7 +163,7 @@ fn setup() -> Result<(WindowSize, NeovimRuntime)> {
     //       This component handles communication from other components to the neovim process. The
     //       commands are split into Serial and Parallel commands. Serial commands must be
     //       processed in order while parallel commands can be processed in any order and in
-    //       parallel.
+    //       parallel. `send_ui` is used to send those commands from the window code.
     //
     // EDITOR:
     //   The editor is responsible for processing and transforming redraw events into something
@@ -144,60 +189,84 @@ fn setup() -> Result<(WindowSize, NeovimRuntime)> {
     //  ------------------
     //
     // Neovide also includes some other systems which are globally available via lazy static
-    // instantiations.
+    // instantiations or passed between components.
     //
-    // EVENT AGGREGATOR:
-    //   Central system which distributes events to each of the other components. This is done
-    //   using TypeIds and channels. Any component can publish any Clone + Debug + Send + Sync type
-    //   to the aggregator, but only one component can subscribe to any type. The system takes
-    //   pains to ensure that channels are shared by thread in order to keep things performant.
-    //   Also tokio channels are used so that the async components can properly await for events.
-    //
-    // SETTINGS:
+    // Settings:
     //   The settings system is live updated from global variables in neovim with the prefix
     //   "neovide". They allow us to configure and manage the functionality of neovide from neovim
     //   init scripts and variables.
     //
-    // REDRAW SCHEDULER:
-    //   The redraw scheduler is a simple system in charge of deciding if the renderer should draw
-    //   another frame next frame, or if it can safely skip drawing to save battery and cpu power.
-    //   Multiple other parts of the app "queue_next_frame" function to ensure animations continue
-    //   properly or updates to the graphics are pushed to the screen.
-    Config::init();
+    // RunningTracker:
+    //   The running tracker responds to quit requests, allowing other systems to trigger a process
+    //   exit.
+    //
+    //  ------------------
+    // | Communication flow |
+    //  ------------------
+    //
+    // The bridge reads from Neovim, and sends `RedrawEvent` to the editor. Some events are also
+    // sent directly to the window event loop using `WindowCommand`. Finally changed settings are
+    // parsed, which are sent as a window event through `SettingChanged`.
+    //
+    // The editor reads `RedrawEvent` and sends `DrawCommand` to the Window.
+    //
+    // The Window event loop sends UICommand to the bridge, which forwards them to Neovim. It also
+    // reads `DrawCommand`, `SettingChanged`, and `WindowCommand` from the other components.
+
+    settings.register::<WindowSettings>();
+    settings.register::<RendererSettings>();
+    settings.register::<CursorSettings>();
+
+    let config = Config::init();
+    Config::watch_config_file(config.clone(), proxy.clone());
+
+    set_hook(Box::new({
+        let path = config.backtraces_path.clone();
+        move |panic_info: &PanicHookInfo<'_>| {
+            let backtrace = Backtrace::new();
+
+            let stderr_msg = generate_stderr_log_message(panic_info, &backtrace);
+            eprintln!("{stderr_msg}");
+
+            log_panic_to_file(panic_info, &backtrace, &path);
+        }
+    }));
 
     //Will exit if -h or -v
-    cmd_line::handle_command_line_arguments(args().collect())?;
+    cmd_line::handle_command_line_arguments(args().collect(), settings.as_ref())?;
     #[cfg(not(target_os = "windows"))]
-    maybe_disown();
+    maybe_disown(&settings);
+
     startup_profiler();
 
     #[cfg(not(test))]
-    init_logger();
+    init_logger(&settings);
 
     trace!("Neovide version: {}", crate_version!());
 
-    SETTINGS.register::<WindowSettings>();
-    SETTINGS.register::<RendererSettings>();
-    SETTINGS.register::<CursorSettings>();
     let window_settings = load_last_window_settings().ok();
-    let window_size = determine_window_size(window_settings.as_ref());
+    let window_size = determine_window_size(window_settings.as_ref(), &settings);
     let grid_size = match window_size {
         WindowSize::Grid(grid_size) => Some(grid_size),
+        // Clippy wrongly suggests to use unwrap or default here
+        #[allow(clippy::manual_unwrap_or_default)]
         _ => match window_settings {
+            Some(PersistentWindowSettings::Maximized { grid_size, .. }) => grid_size,
             Some(PersistentWindowSettings::Windowed { grid_size, .. }) => grid_size,
             _ => None,
         },
     };
+
     let mut runtime = NeovimRuntime::new()?;
-    runtime.launch(grid_size)?;
-    Ok((window_size, runtime))
+    runtime.launch(proxy, grid_size, running_tracker, settings)?;
+    Ok((window_size, config.font, runtime))
 }
 
 #[cfg(not(test))]
-pub fn init_logger() {
-    let settings = SETTINGS.get::<CmdLineSettings>();
+pub fn init_logger(settings: &Settings) {
+    let cmdline_settings = settings.get::<CmdLineSettings>();
 
-    let logger = if settings.log_to_file {
+    let logger = if cmdline_settings.log_to_file {
         Logger::try_with_env_or_str("neovide")
             .expect("Could not init logger")
             .log_to_file(FileSpec::default())
@@ -215,12 +284,13 @@ pub fn init_logger() {
 }
 
 #[cfg(not(target_os = "windows"))]
-fn maybe_disown() {
+fn maybe_disown(settings: &Settings) {
     use std::process;
 
-    let settings = SETTINGS.get::<CmdLineSettings>();
+    let cmdline_settings = settings.get::<CmdLineSettings>();
 
-    if cfg!(debug_assertions) || settings.no_fork {
+    // Never fork unless a tty is attached
+    if !cmdline_settings.fork || !utils::is_tty() {
         return;
     }
 
@@ -229,7 +299,6 @@ fn maybe_disown() {
             .stdin(process::Stdio::null())
             .stdout(process::Stdio::null())
             .stderr(process::Stdio::null())
-            .arg("--no-fork")
             .args(env::args().skip(1))
             .spawn()
             .is_ok());
@@ -239,7 +308,7 @@ fn maybe_disown() {
     }
 }
 
-fn generate_stderr_log_message(panic_info: &PanicInfo, backtrace: &Backtrace) -> String {
+fn generate_stderr_log_message(panic_info: &PanicHookInfo, backtrace: &Backtrace) -> String {
     if cfg!(debug_assertions) {
         let print_backtrace = match env::var("RUST_BACKTRACE") {
             Ok(x) => x == "full" || x == "1",
@@ -263,13 +332,25 @@ fn generate_stderr_log_message(panic_info: &PanicInfo, backtrace: &Backtrace) ->
     }
 }
 
-fn log_panic_to_file(panic_info: &PanicInfo, backtrace: &Backtrace) {
+fn log_panic_to_file(panic_info: &PanicHookInfo, backtrace: &Backtrace, path: &Option<PathBuf>) {
     let log_msg = generate_panic_log_message(panic_info, backtrace);
+
+    let file_path = match path {
+        Some(v) => v,
+        None => &match var(BACKTRACES_FILE_ENV_VAR) {
+            Ok(v) => PathBuf::from(v),
+            Err(_) => settings::neovide_std_datapath().join(DEFAULT_BACKTRACES_FILE),
+        },
+    };
+
+    if let Some(parent) = file_path.parent() {
+        create_dir_all(parent).ok();
+    }
 
     let mut file = match OpenOptions::new()
         .append(true)
-        .open(BACKTRACES_FILE)
-        .or_else(|_| File::create(BACKTRACES_FILE))
+        .open(file_path)
+        .or_else(|_| File::create(file_path))
     {
         Ok(x) => x,
         Err(e) => {
@@ -279,12 +360,12 @@ fn log_panic_to_file(panic_info: &PanicInfo, backtrace: &Backtrace) {
     };
 
     match file.write_all(log_msg.as_bytes()) {
-        Ok(()) => eprintln!("\nBacktrace saved to {BACKTRACES_FILE}!"),
-        Err(e) => eprintln!("Failed writing panic to {BACKTRACES_FILE}: {e}"),
+        Ok(()) => eprintln!("\nBacktrace saved to {:?}!", file_path),
+        Err(e) => eprintln!("Failed writing panic to {:?}: {e}", file_path),
     }
 }
 
-fn generate_panic_log_message(panic_info: &PanicInfo, backtrace: &Backtrace) -> String {
+fn generate_panic_log_message(panic_info: &PanicHookInfo, backtrace: &Backtrace) -> String {
     let system_time: OffsetDateTime = SystemTime::now().into();
 
     let timestamp = system_time
@@ -299,7 +380,7 @@ fn generate_panic_log_message(panic_info: &PanicInfo, backtrace: &Backtrace) -> 
     format!("{full_panic_msg}\n{backtrace:?}\n")
 }
 
-fn generate_panic_message(panic_info: &PanicInfo) -> String {
+fn generate_panic_message(panic_info: &PanicHookInfo) -> String {
     // As per the documentation for `.location()`(https://doc.rust-lang.org/std/panic/struct.PanicInfo.html#method.location)
     // the call to location cannot currently return `None`, so we unwrap.
     let location_info = panic_info.location().unwrap();

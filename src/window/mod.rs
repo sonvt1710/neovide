@@ -1,61 +1,56 @@
 mod error_window;
 mod keyboard_manager;
 mod mouse_manager;
-mod renderer;
 mod settings;
 mod update_loop;
 mod window_wrapper;
 
 #[cfg(target_os = "macos")]
-mod draw_background;
+pub mod macos;
 
 #[cfg(target_os = "linux")]
 use std::env;
 
 use winit::{
-    dpi::PhysicalSize,
-    error::EventLoopError,
-    event::Event,
-    event_loop::{EventLoop, EventLoopBuilder},
-    window::{Icon, WindowBuilder},
+    dpi::{PhysicalSize, Size},
+    event_loop::{ActiveEventLoop, EventLoop},
+    window::{Cursor, Icon, Theme, Window},
 };
 
 #[cfg(target_os = "macos")]
-use winit::platform::macos::WindowBuilderExtMacOS;
+use winit::platform::macos::WindowAttributesExtMacOS;
+
+#[cfg(target_os = "linux")]
+use winit::platform::{wayland::WindowAttributesExtWayland, x11::WindowAttributesExtX11};
+
+#[cfg(target_os = "windows")]
+use winit::platform::windows::WindowAttributesExtWindows;
 
 #[cfg(target_os = "macos")]
-use draw_background::draw_background;
+use winit::platform::macos::EventLoopBuilderExtMacOS;
 
-#[cfg(target_os = "linux")]
-use winit::platform::wayland::WindowBuilderExtWayland;
-#[cfg(target_os = "linux")]
-use winit::platform::x11::WindowBuilderExtX11;
-
-#[cfg(target_os = "windows")]
-use std::{
-    sync::mpsc::{channel, RecvTimeoutError},
-    thread,
-};
-#[cfg(target_os = "windows")]
-use winit::event_loop::ControlFlow;
+#[cfg(target_os = "macos")]
+use macos::register_file_handler;
 
 use image::{load_from_memory, GenericImageView, Pixel};
 use keyboard_manager::KeyboardManager;
 use mouse_manager::MouseManager;
-use renderer::SkiaRenderer;
-use update_loop::UpdateLoop;
-use window_wrapper::WinitWindowWrapper;
 
 use crate::{
     cmd_line::{CmdLineSettings, GeometryArgs},
-    dimensions::Dimensions,
     frame::Frame,
-    renderer::{build_window, GlWindow},
-    running_tracker::*,
-    settings::{load_last_window_settings, save_window_size, PersistentWindowSettings, SETTINGS},
+    renderer::{build_window_config, DrawCommand, WindowConfig},
+    settings::{
+        clamped_grid_size, load_last_window_settings, save_window_size, HotReloadConfigs,
+        PersistentWindowSettings, Settings, SettingsChanged,
+    },
+    units::GridSize,
 };
 pub use error_window::show_error_window;
 pub use settings::{WindowSettings, WindowSettingsChanged};
+pub use update_loop::ShouldRender;
+pub use update_loop::UpdateLoop;
+pub use window_wrapper::WinitWindowWrapper;
 
 static ICON: &[u8] = include_bytes!("../../assets/neovide.ico");
 
@@ -63,32 +58,85 @@ const DEFAULT_WINDOW_SIZE: PhysicalSize<u32> = PhysicalSize {
     width: 500,
     height: 500,
 };
+const MIN_PERSISTENT_WINDOW_SIZE: PhysicalSize<u32> = PhysicalSize {
+    width: 300,
+    height: 150,
+};
+const MAX_PERSISTENT_WINDOW_SIZE: PhysicalSize<u32> = PhysicalSize {
+    width: 8192,
+    height: 8192,
+};
 
-#[derive(Clone, Debug)]
+#[derive(Clone, Debug, PartialEq)]
 pub enum WindowCommand {
     TitleChanged(String),
     SetMouseEnabled(bool),
     ListAvailableFonts,
     FocusWindow,
     Minimize,
+    #[allow(dead_code)] // Theme change is only used on macOS right now
+    ThemeChanged(Option<Theme>),
+    #[cfg(windows)]
+    RegisterRightClick,
+    #[cfg(windows)]
+    UnregisterRightClick,
 }
 
 #[derive(Clone, Debug, PartialEq)]
-pub enum UserEvent {}
+pub enum UserEvent {
+    DrawCommandBatch(Vec<DrawCommand>),
+    WindowCommand(WindowCommand),
+    SettingsChanged(SettingsChanged),
+    ConfigsChanged(Box<HotReloadConfigs>),
+    #[allow(dead_code)]
+    RedrawRequested,
+    NeovimExited,
+}
+
+impl From<Vec<DrawCommand>> for UserEvent {
+    fn from(value: Vec<DrawCommand>) -> Self {
+        UserEvent::DrawCommandBatch(value)
+    }
+}
+
+impl From<WindowCommand> for UserEvent {
+    fn from(value: WindowCommand) -> Self {
+        UserEvent::WindowCommand(value)
+    }
+}
+
+impl From<SettingsChanged> for UserEvent {
+    fn from(value: SettingsChanged) -> Self {
+        UserEvent::SettingsChanged(value)
+    }
+}
+
+impl From<HotReloadConfigs> for UserEvent {
+    fn from(value: HotReloadConfigs) -> Self {
+        UserEvent::ConfigsChanged(Box::new(value))
+    }
+}
 
 pub fn create_event_loop() -> EventLoop<UserEvent> {
-    EventLoopBuilder::<UserEvent>::with_user_event()
-        .build()
-        .expect("Failed to create winit event loop")
+    let mut builder = EventLoop::with_user_event();
+    #[cfg(target_os = "macos")]
+    builder.with_default_menu(false);
+    let event_loop = builder.build().expect("Failed to create winit event loop");
+    #[cfg(target_os = "macos")]
+    register_file_handler();
+    #[allow(clippy::let_and_return)]
+    event_loop
 }
 
 pub fn create_window(
-    event_loop: &EventLoop<UserEvent>,
-    initial_window_size: &WindowSize,
-) -> GlWindow {
+    event_loop: &ActiveEventLoop,
+    maximized: bool,
+    title: &str,
+    settings: &Settings,
+) -> WindowConfig {
     let icon = load_icon();
 
-    let cmd_line_settings = SETTINGS.get::<CmdLineSettings>();
+    let cmd_line_settings = settings.get::<CmdLineSettings>();
 
     let window_settings = load_last_window_settings().ok();
 
@@ -97,113 +145,106 @@ pub fn create_window(
         _ => None,
     };
 
-    log::trace!("Settings initial_window_size {:?}", initial_window_size);
+    let mouse_cursor_icon = cmd_line_settings.mouse_cursor_icon;
 
-    // NOTE: For Geometry, the window is resized when it's shown based on the font and other
-    // settings.
-    let inner_size = match *initial_window_size {
-        WindowSize::Size(size) => size,
-        _ => DEFAULT_WINDOW_SIZE,
-    };
-
-    let winit_window_builder = WindowBuilder::new()
-        .with_title("Neovide")
-        .with_window_icon(Some(icon))
-        .with_inner_size(inner_size)
-        // Unfortunately we can't maximize here, because winit shows the window momentarily causing
-        // flickering
-        .with_maximized(false)
+    let window_attributes = Window::default_attributes()
+        .with_title(title)
+        .with_cursor(Cursor::Icon(mouse_cursor_icon.parse()))
+        .with_maximized(maximized)
         .with_transparent(true)
         .with_visible(false);
 
+    #[cfg(target_family = "unix")]
+    let window_attributes = window_attributes.with_window_icon(Some(icon));
+
+    #[cfg(target_os = "windows")]
+    let window_attributes = window_attributes
+        .with_window_icon(Some(icon.clone()))
+        .with_taskbar_icon(Some(icon));
+
+    #[cfg(target_os = "windows")]
+    let window_attributes = if !cmd_line_settings.opengl {
+        WindowAttributesExtWindows::with_no_redirection_bitmap(window_attributes, true)
+    } else {
+        window_attributes
+    };
+
     let frame_decoration = cmd_line_settings.frame;
+
+    #[cfg(target_os = "macos")]
+    let title_hidden = cmd_line_settings.title_hidden;
 
     // There is only two options for windows & linux, no need to match more options.
     #[cfg(not(target_os = "macos"))]
-    let mut winit_window_builder =
-        winit_window_builder.with_decorations(frame_decoration == Frame::Full);
+    let mut window_attributes = window_attributes.with_decorations(frame_decoration == Frame::Full);
 
     #[cfg(target_os = "macos")]
-    let mut winit_window_builder = match frame_decoration {
-        Frame::Full => winit_window_builder,
-        Frame::None => winit_window_builder.with_decorations(false),
-        Frame::Buttonless => winit_window_builder
-            .with_transparent(true)
-            .with_title_hidden(true)
+    let mut window_attributes = match frame_decoration {
+        Frame::Full => window_attributes,
+        Frame::None => window_attributes.with_decorations(false),
+        Frame::Buttonless => window_attributes
+            .with_title_hidden(title_hidden)
             .with_titlebar_buttons_hidden(true)
             .with_titlebar_transparent(true)
             .with_fullsize_content_view(true),
-        Frame::Transparent => winit_window_builder
-            .with_title_hidden(true)
+        Frame::Transparent => window_attributes
+            .with_title_hidden(title_hidden)
             .with_titlebar_transparent(true)
             .with_fullsize_content_view(true),
     };
 
     if let Some(previous_position) = previous_position {
-        winit_window_builder = winit_window_builder.with_position(previous_position);
+        window_attributes = window_attributes.with_position(previous_position);
     }
 
     #[cfg(target_os = "linux")]
-    let winit_window_builder = {
+    let window_attributes = {
         if env::var("WAYLAND_DISPLAY").is_ok() {
             let app_id = &cmd_line_settings.wayland_app_id;
-            WindowBuilderExtWayland::with_name(winit_window_builder, "neovide", app_id.clone())
+            WindowAttributesExtWayland::with_name(window_attributes, app_id.clone(), "neovide")
         } else {
             let class = &cmd_line_settings.x11_wm_class;
             let instance = &cmd_line_settings.x11_wm_class_instance;
-            WindowBuilderExtX11::with_name(winit_window_builder, class, instance)
+            WindowAttributesExtX11::with_name(window_attributes, class, instance)
         }
     };
 
     #[cfg(target_os = "macos")]
-    let winit_window_builder = winit_window_builder.with_accepts_first_mouse(false);
+    let window_attributes = window_attributes.with_accepts_first_mouse(false);
 
-    let gl_window = build_window(winit_window_builder, event_loop);
-    let window = &gl_window.window;
+    #[allow(clippy::let_and_return)]
+    let window_config = build_window_config(window_attributes, event_loop, settings);
 
-    // Check that window is visible in some monitor, and reposition it if not.
-    window.current_monitor().and_then(|current_monitor| {
-        let monitor_position = current_monitor.position();
-        let monitor_size = current_monitor.size();
-        let monitor_width = monitor_size.width as i32;
-        let monitor_height = monitor_size.height as i32;
+    #[cfg(target_os = "macos")]
+    if let Some(previous_position) = previous_position {
+        window_config.window.set_outer_position(previous_position);
+    }
 
-        let window_position = previous_position.or_else(|| window.outer_position().ok())?;
-
-        let window_size = window.outer_size();
-        let window_width = window_size.width as i32;
-        let window_height = window_size.height as i32;
-
-        if window_position.x + window_width < monitor_position.x
-            || window_position.y + window_height < monitor_position.y
-            || window_position.x > monitor_position.x + monitor_width
-            || window_position.y > monitor_position.y + monitor_height
-        {
-            window.set_outer_position(monitor_position);
-        }
-
-        Some(())
-    });
-
-    gl_window
+    window_config
 }
 
 #[derive(Clone, Debug)]
 pub enum WindowSize {
     Size(PhysicalSize<u32>),
     Maximized,
-    Grid(Dimensions),
+    Grid(GridSize<u32>),
     NeovimGrid, // The geometry is read from init.vim/lua
 }
 
-pub fn determine_window_size(window_settings: Option<&PersistentWindowSettings>) -> WindowSize {
-    let cmd_line = SETTINGS.get::<CmdLineSettings>();
+pub fn determine_window_size(
+    window_settings: Option<&PersistentWindowSettings>,
+    settings: &Settings,
+) -> WindowSize {
+    let cmd_line = settings.get::<CmdLineSettings>();
 
     match cmd_line.geometry {
         GeometryArgs {
             grid: Some(Some(dimensions)),
             ..
-        } => WindowSize::Grid(dimensions.clamped_grid_size()),
+        } => WindowSize::Grid(clamped_grid_size(&GridSize::new(
+            dimensions.width.try_into().unwrap(),
+            dimensions.height.try_into().unwrap(),
+        ))),
         GeometryArgs {
             grid: Some(None), ..
         } => WindowSize::NeovimGrid,
@@ -215,114 +256,26 @@ pub fn determine_window_size(window_settings: Option<&PersistentWindowSettings>)
             maximized: true, ..
         } => WindowSize::Maximized,
         _ => match window_settings {
-            Some(PersistentWindowSettings::Maximized) => WindowSize::Maximized,
+            Some(PersistentWindowSettings::Maximized { .. }) => WindowSize::Maximized,
             Some(PersistentWindowSettings::Windowed {
                 pixel_size: Some(pixel_size),
                 ..
-            }) => WindowSize::Size(*pixel_size),
+            }) => {
+                let size = Size::new(*pixel_size);
+                let scale = 1.0;
+                WindowSize::Size(
+                    Size::clamp(
+                        size,
+                        MIN_PERSISTENT_WINDOW_SIZE.into(),
+                        MAX_PERSISTENT_WINDOW_SIZE.into(),
+                        scale,
+                    )
+                    .to_physical(scale),
+                )
+            }
             _ => WindowSize::Size(DEFAULT_WINDOW_SIZE),
         },
     }
-}
-
-// Use a render thread on Windows to work around performance issues with Winit
-// see: https://github.com/rust-windowing/winit/issues/2782
-#[cfg(target_os = "windows")]
-pub fn main_loop(
-    window: GlWindow,
-    initial_window_size: WindowSize,
-    event_loop: EventLoop<UserEvent>,
-) -> Result<(), EventLoopError> {
-    let cmd_line_settings = SETTINGS.get::<CmdLineSettings>();
-    let (tx, rx) = channel::<Event<UserEvent>>();
-
-    let render_thread_handle = thread::spawn(move || {
-        let mut window_wrapper = WinitWindowWrapper::new(window, initial_window_size);
-        let mut update_loop = UpdateLoop::new(cmd_line_settings.idle);
-
-        loop {
-            if !RUNNING_TRACKER.is_running() {
-                break;
-            }
-
-            let (wait_duration, _) = update_loop.get_event_wait_time();
-            let event = rx
-                .recv_timeout(wait_duration)
-                .map_err(|e| matches!(e, RecvTimeoutError::Disconnected));
-
-            if update_loop.step(&mut window_wrapper, event).is_err() {
-                break;
-            }
-        }
-
-        let window = window_wrapper.windowed_context.window();
-        save_window_size(
-            window.is_maximized(),
-            window.inner_size(),
-            window_wrapper.get_grid_size(),
-            window.outer_position().ok(),
-        );
-    });
-
-    let result = event_loop.run(|e, window_target| {
-        match e {
-            Event::LoopExiting => {
-                return;
-            }
-            Event::AboutToWait => {}
-            _ => {
-                let _ = tx.send(e);
-            }
-        }
-
-        if render_thread_handle.is_finished() {
-            window_target.exit();
-        }
-
-        // We need to wake up regularly to check if the render thread has exited.
-        // We can't exit until the render thread has dropped the window wrapper.
-        window_target.set_control_flow(ControlFlow::WaitUntil(
-            std::time::Instant::now() + std::time::Duration::from_millis(100),
-        ));
-    });
-
-    // Manually drop in case the event loop ended prematurely because of a winit or other error.
-    // This will unblock the render thread before the join.
-    drop(tx);
-
-    render_thread_handle.join().unwrap();
-    result
-}
-
-#[cfg(not(target_os = "windows"))]
-pub fn main_loop(
-    window: GlWindow,
-    initial_window_size: WindowSize,
-    event_loop: EventLoop<UserEvent>,
-) -> Result<(), EventLoopError> {
-    let cmd_line_settings = SETTINGS.get::<CmdLineSettings>();
-    let mut window_wrapper = WinitWindowWrapper::new(window, initial_window_size);
-
-    let mut update_loop = UpdateLoop::new(cmd_line_settings.idle);
-
-    event_loop.run(move |e, window_target| {
-        if e == Event::LoopExiting {
-            return;
-        }
-
-        if !RUNNING_TRACKER.is_running() {
-            let window = window_wrapper.windowed_context.window();
-            save_window_size(
-                window.is_maximized(),
-                window.inner_size(),
-                window_wrapper.get_grid_size(),
-                window.outer_position().ok(),
-            );
-            window_target.exit();
-        } else {
-            window_target.set_control_flow(update_loop.step(&mut window_wrapper, Ok(e)).unwrap());
-        }
-    })
 }
 
 pub fn load_icon() -> Icon {

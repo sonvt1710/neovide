@@ -1,3 +1,4 @@
+mod api_info;
 mod clipboard;
 mod command;
 mod events;
@@ -6,64 +7,46 @@ pub mod session;
 mod setup;
 mod ui_commands;
 
+use std::{io::Error, ops::Add, sync::Arc, time::Duration};
+
 use anyhow::{bail, Context, Result};
 use itertools::Itertools;
-use log::{error, info};
+use log::info;
 use nvim_rs::{error::CallError, Neovim, UiAttachOptions, Value};
 use rmpv::Utf8String;
-use std::{io::Error, ops::Add, sync::Arc};
 use tokio::{
     runtime::{Builder, Runtime},
-    task::JoinHandle,
+    select,
+    time::timeout,
 };
+use winit::event_loop::EventLoopProxy;
 
-use crate::{cmd_line::CmdLineSettings, dimensions::Dimensions, running_tracker::*, settings::*};
-use handler::NeovimHandler;
+use crate::{
+    cmd_line::CmdLineSettings, editor::start_editor, running_tracker::RunningTracker, settings::*,
+    units::GridSize, window::UserEvent,
+};
+pub use handler::NeovimHandler;
 use session::{NeovimInstance, NeovimSession};
-use setup::setup_neovide_specific_state;
+use setup::{get_api_information, setup_neovide_specific_state};
 
 pub use command::create_nvim_command;
 pub use events::*;
 pub use session::NeovimWriter;
-pub use ui_commands::{start_ui_command_handler, ParallelCommand, SerialCommand, UiCommand};
+pub use ui_commands::{send_ui, start_ui_command_handler, ParallelCommand, SerialCommand};
 
-const INTRO_MESSAGE_LUA: &str = include_str!("../../lua/intro.lua");
-const NEOVIM_REQUIRED_VERSION: &str = "0.9.2";
-
-enum RuntimeState {
-    Idle,
-    Attached(JoinHandle<()>),
-}
+const NEOVIM_REQUIRED_VERSION: &str = "0.10.0";
 
 pub struct NeovimRuntime {
-    runtime: Runtime,
-    state: RuntimeState,
+    pub runtime: Runtime,
 }
 
-fn neovim_instance() -> Result<NeovimInstance> {
-    if let Some(address) = SETTINGS.get::<CmdLineSettings>().server {
+fn neovim_instance(settings: &Settings) -> Result<NeovimInstance> {
+    if let Some(address) = settings.get::<CmdLineSettings>().server {
         Ok(NeovimInstance::Server { address })
     } else {
-        let cmd = create_nvim_command()?;
+        let cmd = create_nvim_command(settings)?;
         Ok(NeovimInstance::Embedded(cmd))
     }
-}
-
-pub async fn setup_intro_message_autocommand(
-    nvim: &Neovim<NeovimWriter>,
-) -> Result<Value, Box<CallError>> {
-    let args = vec![Value::from("setup_autocommand")];
-    nvim.exec_lua(INTRO_MESSAGE_LUA, args).await
-}
-
-pub async fn show_intro_message(
-    nvim: &Neovim<NeovimWriter>,
-    message: &[String],
-) -> Result<(), Box<CallError>> {
-    let mut args = vec![Value::from("show_intro")];
-    let lines = message.iter().map(|line| Value::from(line.as_str()));
-    args.extend(lines);
-    nvim.exec_lua(INTRO_MESSAGE_LUA, args).await.map(|_| ())
 }
 
 pub async fn show_error_message(
@@ -90,10 +73,13 @@ pub async fn show_error_message(
     nvim.echo(prepared_lines, true, vec![]).await
 }
 
-async fn launch(grid_size: Option<Dimensions>) -> Result<NeovimSession> {
-    let neovim_instance = neovim_instance()?;
+async fn launch(
+    handler: NeovimHandler,
+    grid_size: Option<GridSize<u32>>,
+    settings: Arc<Settings>,
+) -> Result<NeovimSession> {
+    let neovim_instance = neovim_instance(settings.as_ref())?;
 
-    let handler = NeovimHandler::new();
     let session = NeovimSession::new(neovim_instance, handler)
         .await
         .context("Could not locate or start neovim process")?;
@@ -110,22 +96,36 @@ async fn launch(grid_size: Option<Dimensions>) -> Result<NeovimSession> {
             bail!("Neovide requires nvim version {NEOVIM_REQUIRED_VERSION} or higher. Download the latest version here https://github.com/neovim/neovim/wiki/Installing-Neovim");
         }
     }
-    let settings = SETTINGS.get::<CmdLineSettings>();
 
-    let should_handle_clipboard = settings.wsl || settings.server.is_some();
-    setup_neovide_specific_state(&session.neovim, should_handle_clipboard).await?;
+    let cmdline_settings = settings.get::<CmdLineSettings>();
 
-    start_ui_command_handler(Arc::clone(&session.neovim));
-    SETTINGS.read_initial_values(&session.neovim).await?;
+    let should_handle_clipboard = cmdline_settings.wsl || cmdline_settings.server.is_some();
+    let api_information = get_api_information(&session.neovim).await?;
+    info!(
+        "Neovide registered to nvim with channel id {}",
+        api_information.channel
+    );
+    // This is too verbose to keep enabled all the time
+    // log::info!("Api information {:#?}", api_information);
+    setup_neovide_specific_state(
+        &session.neovim,
+        should_handle_clipboard,
+        &api_information,
+        &settings,
+    )
+    .await?;
+
+    start_ui_command_handler(session.neovim.clone(), settings.clone());
+    settings.read_initial_values(&session.neovim).await?;
 
     let mut options = UiAttachOptions::new();
     options.set_linegrid_external(true);
-    options.set_multigrid_external(!settings.no_multi_grid);
+    options.set_multigrid_external(!cmdline_settings.no_multi_grid);
     options.set_rgb(true);
 
     // Triggers loading the user config
 
-    let grid_size = grid_size.map_or(DEFAULT_GRID_SIZE, |v| v.clamped_grid_size());
+    let grid_size = grid_size.map_or(DEFAULT_GRID_SIZE, |v| clamped_grid_size(&v));
     let res = session
         .neovim
         .ui_attach(grid_size.width as i64, grid_size.height as i64, &options)
@@ -136,43 +136,56 @@ async fn launch(grid_size: Option<Dimensions>) -> Result<NeovimSession> {
     res.map(|()| session)
 }
 
-async fn run(session: NeovimSession) {
-    match session.io_handle.await {
-        Err(join_error) => error!("Error joining IO loop: '{}'", join_error),
-        Ok(Err(error)) => {
-            if !error.is_channel_closed() {
-                error!("Error: '{}'", error);
+async fn run(session: NeovimSession, proxy: EventLoopProxy<UserEvent>) {
+    let mut session = session;
+
+    if let Some(process) = session.neovim_process.as_mut() {
+        // We primarily wait for the stdio to finish, but due to bugs,
+        // for example, this one in in Neovim 0.9.5
+        // https://github.com/neovim/neovim/issues/26743
+        // it does not always finish.
+        // So wait for some additional time, both to make the bug obvious and to prevent incomplete
+        // data.
+        select! {
+            _ = &mut session.io_handle => {}
+            _ = process.wait() => {
+                // Wait a little bit more if we detect that Neovim exits before the stream, to
+                // allow us to finish reading from it.
+                log::info!("The Neovim process quit before the IO stream, waiting for a half second");
+                if timeout(Duration::from_millis(500), &mut session.io_handle)
+                        .await
+                        .is_err()
+                {
+                    log::info!("The IO stream was never closed, forcing Neovide to exit");
+                }
             }
-        }
-        Ok(Ok(())) => {}
-    };
-    RUNNING_TRACKER.quit("neovim processed failed");
+        };
+    } else {
+        session.io_handle.await.ok();
+    }
+    log::info!("Neovim has quit");
+    proxy.send_event(UserEvent::NeovimExited).ok();
 }
 
 impl NeovimRuntime {
     pub fn new() -> Result<Self, Error> {
         let runtime = Builder::new_multi_thread().enable_all().build()?;
 
-        Ok(Self {
-            runtime,
-            state: RuntimeState::Idle,
-        })
+        Ok(Self { runtime })
     }
 
-    pub fn launch(&mut self, grid_size: Option<Dimensions>) -> Result<()> {
-        assert!(matches!(self.state, RuntimeState::Idle));
-        let session = self.runtime.block_on(launch(grid_size))?;
-        self.state = RuntimeState::Attached(self.runtime.spawn(run(session)));
+    pub fn launch(
+        &mut self,
+        event_loop_proxy: EventLoopProxy<UserEvent>,
+        grid_size: Option<GridSize<u32>>,
+        running_tracker: RunningTracker,
+        settings: Arc<Settings>,
+    ) -> Result<()> {
+        let handler = start_editor(event_loop_proxy.clone(), running_tracker, settings.clone());
+        let session = self
+            .runtime
+            .block_on(launch(handler, grid_size, settings))?;
+        self.runtime.spawn(run(session, event_loop_proxy));
         Ok(())
-    }
-}
-
-impl Drop for NeovimRuntime {
-    fn drop(&mut self) {
-        if let RuntimeState::Attached(join_handle) =
-            std::mem::replace(&mut self.state, RuntimeState::Idle)
-        {
-            let _ = self.runtime.block_on(join_handle);
-        }
     }
 }

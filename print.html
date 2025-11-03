@@ -1219,6 +1219,11 @@ window containing Neovide to the front and activate it. This
 is useful for tools like neovim_remote which can manipulate
 neovim remotely or if long running tasks would like to
 activate the Neovide window after finishing.</p>
+<h2 id="open-config-file-unreleased-yet"><a class="header" href="#open-config-file-unreleased-yet">Open Config File (Unreleased yet)</a></h2>
+<p>Running the <code>NeovideConfig</code> command will open your Neovide
+configuration file for editing. This provides a simple and
+discoverable way to access your settings without needing to
+know the platform-specific path to the file.</p>
 <div style="break-before: page; page-break-before: always;"></div><h1 id="command-line-reference"><a class="header" href="#command-line-reference">Command Line Reference</a></h1>
 <p>Neovide supports a few command line arguments for effecting things which couldn't be set using
 normal vim variables.</p>
@@ -1321,7 +1326,7 @@ to its generalistic purpose.</p>
 <pre><code class="language-sh">--icon &lt;path&gt;
 </code></pre>
 <p><strong>Unreleased yet.</strong></p>
-<p>This sets a custom application icon.</p>
+<p>This sets a custom application icon. A default icon is bundled with Neovide.</p>
 <h3 id="srgb"><a class="header" href="#srgb">sRGB</a></h3>
 <pre><code class="language-sh">--no-srgb, --srgb or $NEOVIDE_SRGB=0|1
 </code></pre>
@@ -1410,6 +1415,7 @@ however.)</p>
 fork = false
 frame = &quot;full&quot;
 idle = true
+icon = &quot;/full/path/to/neovide.ico&quot; # Example path. Default icon is bundled. Use .icns on macOS.
 maximized = false
 mouse-cursor-icon = &quot;arrow&quot;
 neovim-bin = &quot;/usr/bin/nvim&quot; # in reality found dynamically on $PATH if unset
